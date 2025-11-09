@@ -15,8 +15,6 @@ Climate-vulnerable communities lack access to green skills and economic opportun
 - Match users to paid climate micro-jobs using ML algorithms
 - Track real environmental impact (trees, CO2, income)
 
-```
-
 ## 📊 Impact
 
 **Social**: Jobs for marginalized communities  
