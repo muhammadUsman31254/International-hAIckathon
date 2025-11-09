@@ -1,0 +1,19 @@
+project_id = "elvqhztredjampvqemav"
+
+[functions.generate-module-questions]
+verify_jwt = false
+
+[functions.generate-course-questions]
+verify_jwt = false
+
+[functions.generate-course-content]
+verify_jwt = false
+
+[functions.match-climate-jobs]
+verify_jwt = false
+
+[functions.recommend-jobs]
+verify_jwt = false
+
+[functions.generate-climate-jobs]
+verify_jwt = false

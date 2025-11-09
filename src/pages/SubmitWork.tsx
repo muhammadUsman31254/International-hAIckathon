@@ -1,0 +1,605 @@
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import * as z from "zod";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { supabase } from "@/integrations/supabase/client";
+import { toast } from "sonner";
+import { Loader2, Upload, MapPin, CheckCircle2, XCircle, Shield } from "lucide-react";
+import { pipeline } from "@huggingface/transformers";
+import Tesseract from "tesseract.js";
+
+const formSchema = z.object({
+  title: z.string().min(5, "Title must be at least 5 characters"),
+  description: z.string().min(20, "Description must be at least 20 characters"),
+  work_type: z.string().min(1, "Please select a work type"),
+  location: z.string().min(3, "Location is required"),
+  latitude: z.string().optional(),
+  longitude: z.string().optional(),
+});
+
+const workTypes = [
+  "Tree Planting",
+  "Clean Water",
+  "Solar Installation",
+  "Waste Management",
+  "Community Garden",
+  "Energy Audit",
+  "Conservation",
+  "Other"
+];
+
+const SubmitWork = () => {
+  const navigate = useNavigate();
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [mediaFile, setMediaFile] = useState<File | null>(null);
+  const [mediaPreview, setMediaPreview] = useState<string | null>(null);
+  const [verificationToken, setVerificationToken] = useState<string>("");
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [isVerified, setIsVerified] = useState(false);
+  const [detectedText, setDetectedText] = useState<string>("");
+  const [detectionDetails, setDetectionDetails] = useState<{ model: string; text: string }[]>([]);
+
+  const form = useForm<z.infer<typeof formSchema>>({
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      title: "",
+      description: "",
+      work_type: "",
+      location: "",
+      latitude: "",
+      longitude: "",
+    },
+  });
+
+  // Generate verification token on component mount
+  useEffect(() => {
+    const token = Math.floor(100000 + Math.random() * 900000).toString();
+    setVerificationToken(token);
+  }, []);
+
+  // Preprocess image: grayscale + contrast + threshold, resize to 1024px width max
+  const preprocessImage = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const maxW = 1024;
+        const scale = Math.min(1, maxW / img.width);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          URL.revokeObjectURL(url);
+          reject(new Error('Canvas context not available'));
+          return;
+        }
+        
+        // Draw image
+        ctx.drawImage(img, 0, 0, w, h);
+        const imageData = ctx.getImageData(0, 0, w, h);
+        const data = imageData.data;
+        
+        // Enhanced preprocessing: grayscale + high contrast + threshold
+        const contrast = 2.0; // Higher contrast
+        const intercept = 128 * (1 - contrast);
+        const threshold = 128; // Threshold for binary conversion
+        
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          // Convert to grayscale using luminance
+          let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+          // Apply contrast
+          gray = gray * contrast + intercept;
+          // Clamp values
+          gray = Math.max(0, Math.min(255, gray));
+          // Apply threshold for binary effect (makes digits clearer)
+          gray = gray > threshold ? 255 : 0;
+          data[i] = data[i + 1] = data[i + 2] = gray;
+        }
+        ctx.putImageData(imageData, 0, 0);
+        const out = canvas.toDataURL('image/png');
+        URL.revokeObjectURL(url);
+        resolve(out);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load image'));
+      };
+      img.src = url;
+    });
+  };
+
+  // Helper function to check if token is found in text (with fuzzy matching)
+  const findTokenInText = (text: string, token: string): boolean => {
+    const tokenDigits = token.replace(/\D/g, "");
+    const cleanText = text.replace(/\D/g, "");
+    
+    if (!tokenDigits || tokenDigits.length === 0) return false;
+    
+    // Exact match
+    if (cleanText.includes(tokenDigits)) return true;
+    
+    // Try partial matches (at least 4 consecutive digits)
+    if (tokenDigits.length >= 4) {
+      for (let i = 0; i <= tokenDigits.length - 4; i++) {
+        const partial = tokenDigits.substring(i, i + 4);
+        if (cleanText.includes(partial)) return true;
+      }
+    }
+    
+    // Try reversed token (in case OCR reads backwards)
+    const reversed = tokenDigits.split('').reverse().join('');
+    if (cleanText.includes(reversed)) return true;
+    
+    return false;
+  };
+
+  const verifyImageToken = async (file: File) => {
+    setIsVerifying(true);
+    setIsVerified(false);
+    setDetectedText("");
+    setDetectionDetails([]);
+
+    let matched = false;
+    const tokenDigits = verificationToken.replace(/\D/g, "");
+
+    try {
+      // Preprocess image once
+      const processedUrl = await preprocessImage(file);
+
+      // 1) Try Tesseract.js first (more reliable for digits)
+      if (!matched) {
+        try {
+          // Try multiple Tesseract configurations for better results
+          const configs = [
+            {
+              tessedit_char_whitelist: '0123456789',
+              tessedit_pageseg_mode: '8', // Single word
+            },
+            {
+              tessedit_char_whitelist: '0123456789',
+              tessedit_pageseg_mode: '7', // Single text line
+            },
+            {
+              tessedit_char_whitelist: '0123456789',
+              tessedit_pageseg_mode: '6', // Single uniform block
+            },
+          ];
+
+          for (const config of configs) {
+            try {
+              const { data } = await Tesseract.recognize(processedUrl, 'eng', config as any);
+              const text = (data?.text || "").trim();
+              if (text) {
+                setDetectionDetails((prev) => [...prev, { model: `tesseract.js (PSM ${config.tessedit_pageseg_mode})`, text }]);
+                if (findTokenInText(text, verificationToken)) {
+                  matched = true;
+                  setDetectedText(text);
+                  setIsVerified(true);
+                  toast.success(`Token verified! Detected: "${text}"`);
+                  break;
+                }
+              }
+            } catch (err) {
+              // Try next config
+              continue;
+            }
+          }
+        } catch (tErr) {
+          console.warn('Tesseract failed:', tErr);
+          setDetectionDetails((prev) => [...prev, { model: 'tesseract.js', text: '<model error>' }]);
+        }
+      }
+
+      // 2) Try TrOCR as fallback (if Tesseract didn't work)
+      if (!matched) {
+        const model = "Xenova/trocr-large-handwritten";
+        try {
+          let detector: any;
+          try {
+            detector = await pipeline("image-to-text", model as any, { device: "webgpu" as any });
+          } catch (_) {
+            try {
+              detector = await pipeline("image-to-text", model as any, { device: "wasm" as any, dtype: "fp32" as any });
+            } catch (__) {
+              // Skip TrOCR if both devices fail
+              throw new Error("TrOCR not available");
+            }
+          }
+          const result: any = await detector(processedUrl);
+          const text = (Array.isArray(result) ? result[0]?.generated_text : result?.generated_text) || "";
+          if (text) {
+            setDetectionDetails((prev) => [...prev, { model, text }]);
+            if (findTokenInText(text, verificationToken)) {
+              matched = true;
+              setDetectedText(text);
+              setIsVerified(true);
+              toast.success(`Verified with ${model}. Detected: "${text}"`);
+            } else {
+              setDetectedText(text);
+            }
+          }
+        } catch (err) {
+          console.warn(`OCR failed for ${model}:`, err);
+          setDetectionDetails((prev) => [...prev, { model, text: "<model error>" }]);
+        }
+      }
+
+      // 3) Final fallback: Try Tesseract without whitelist (in case digits are mixed with text)
+      if (!matched) {
+        try {
+          const { data } = await Tesseract.recognize(processedUrl, 'eng', {
+            tessedit_pageseg_mode: '8',
+          } as any);
+          const text = (data?.text || "").trim();
+          if (text) {
+            setDetectionDetails((prev) => [...prev, { model: 'tesseract.js (all chars)', text }]);
+            if (findTokenInText(text, verificationToken)) {
+              matched = true;
+              setDetectedText(text);
+              setIsVerified(true);
+              toast.success(`Token verified! Detected: "${text}"`);
+            }
+          }
+        } catch (tErr) {
+          // Ignore final fallback errors
+        }
+      }
+
+      if (!matched) {
+        setIsVerified(false);
+        const allDetected = detectionDetails.map(d => d.text).filter(t => t && !t.includes('error')).join(' | ');
+        toast.error(`Token not found. Expected: ${verificationToken}. Detected: ${allDetected || 'No text'}. Try writing larger, darker digits with good contrast.`);
+      }
+    } catch (error) {
+      console.error("Verification error:", error);
+      toast.error("Verification failed. Please try again with a clearer image.");
+      setIsVerified(false);
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  const handleMediaChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.size > 10 * 1024 * 1024) {
+        toast.error("File size must be less than 10MB");
+        return;
+      }
+
+      // Only accept images for verification
+      if (!file.type.startsWith('image')) {
+        toast.error("Please upload an image with the verification token visible");
+        return;
+      }
+      
+      setMediaFile(file);
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setMediaPreview(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+
+      // Verify token in image
+      await verifyImageToken(file);
+    }
+  };
+
+  const getCurrentLocation = () => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          form.setValue("latitude", position.coords.latitude.toString());
+          form.setValue("longitude", position.coords.longitude.toString());
+          toast.success("Location captured successfully");
+        },
+        (error) => {
+          toast.error("Could not get your location: " + error.message);
+        }
+      );
+    } else {
+      toast.error("Geolocation is not supported by your browser");
+    }
+  };
+
+  const onSubmit = async (values: z.infer<typeof formSchema>) => {
+    if (!mediaFile) {
+      toast.error("Please upload a photo with the verification token");
+      return;
+    }
+
+    if (!isVerified) {
+      toast.error("Please upload an image with the verification token visible");
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        toast.error("You must be logged in to submit your work");
+        navigate("/auth");
+        return;
+      }
+
+      let mediaUrl = null;
+      let mediaType = null;
+
+      // Upload media if provided
+      if (mediaFile) {
+        const fileExt = mediaFile.name.split('.').pop();
+        const fileName = `${user.id}/${Date.now()}.${fileExt}`;
+        
+        const { error: uploadError, data } = await supabase.storage
+          .from('micro-job-media')
+          .upload(fileName, mediaFile);
+
+        if (uploadError) throw uploadError;
+
+        const { data: { publicUrl } } = supabase.storage
+          .from('micro-job-media')
+          .getPublicUrl(fileName);
+
+        mediaUrl = publicUrl;
+        mediaType = mediaFile.type.startsWith('video') ? 'video' : 'image';
+      }
+
+      // Insert micro job
+      const { error: insertError } = await supabase
+        .from('micro_jobs')
+        .insert({
+          user_id: user.id,
+          title: values.title,
+          description: values.description,
+          work_type: values.work_type,
+          location: values.location,
+          latitude: values.latitude ? parseFloat(values.latitude) : null,
+          longitude: values.longitude ? parseFloat(values.longitude) : null,
+          media_url: mediaUrl,
+          media_type: mediaType,
+          status: 'pending',
+          benefit_points: 10, // Base points, can be adjusted
+        });
+
+      if (insertError) throw insertError;
+
+      toast.success("Work submitted successfully! It will be reviewed shortly and you'll earn benefit points once approved.");
+      navigate("/jobs");
+    } catch (error: any) {
+      console.error("Error submitting work:", error);
+      toast.error(error.message || "Failed to submit work");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-background to-secondary/20 py-8 px-4">
+      <div className="max-w-2xl mx-auto">
+        <div className="mb-8">
+          <h1 className="text-4xl font-bold text-foreground mb-2">Submit Your Climate Work</h1>
+          <p className="text-muted-foreground">
+            Log your completed climate action work with proof and earn benefit points!
+          </p>
+        </div>
+
+        <div className="bg-card rounded-lg shadow-lg p-6 mb-6">
+          <div className="flex items-start gap-4 p-4 bg-primary/10 border-2 border-primary rounded-lg">
+            <Shield className="h-8 w-8 text-primary flex-shrink-0 mt-1" />
+            <div className="flex-1">
+              <h3 className="font-semibold text-lg mb-2">Verification Token Required</h3>
+              <p className="text-sm text-muted-foreground mb-3">
+                To verify your work is genuine, write this token on paper and include it in your photo:
+              </p>
+              <div className="bg-background p-4 rounded-lg border-2 border-primary inline-block">
+                <p className="text-4xl font-bold text-primary font-mono tracking-wider">
+                  {verificationToken}
+                </p>
+              </div>
+              <p className="text-xs text-muted-foreground mt-3">
+                Example: Write "{verificationToken}" on paper, take a photo showing both the token and your work.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-card rounded-lg shadow-lg p-6">
+          <Form {...form}>
+            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+              <FormField
+                control={form.control}
+                name="title"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Work Title</FormLabel>
+                    <FormControl>
+                      <Input placeholder="e.g., Planted 10 trees in Central Park" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="work_type"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Work Type</FormLabel>
+                    <Select onValueChange={field.onChange} defaultValue={field.value}>
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select work type" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {workTypes.map((type) => (
+                          <SelectItem key={type} value={type}>
+                            {type}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="description"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Description</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        placeholder="Describe what you did, how much time it took, and its environmental impact..."
+                        className="min-h-[120px]"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="location"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Location</FormLabel>
+                    <div className="flex gap-2">
+                      <FormControl>
+                        <Input placeholder="e.g., Central Park, New York" {...field} />
+                      </FormControl>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        onClick={getCurrentLocation}
+                      >
+                        <MapPin className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <div>
+                <FormLabel>Upload Proof Photo with Token *</FormLabel>
+                <p className="text-xs text-muted-foreground mb-2">
+                  Image must show the verification token and your completed work
+                </p>
+                <div className="mt-2 border-2 border-dashed border-border rounded-lg p-6 text-center">
+                  <input
+                    type="file"
+                    id="media-upload"
+                    accept="image/*"
+                    onChange={handleMediaChange}
+                    className="hidden"
+                  />
+                  <label htmlFor="media-upload" className="cursor-pointer">
+                    {mediaPreview ? (
+                      <div className="space-y-2">
+                        <img src={mediaPreview} alt="Preview" className="max-h-64 mx-auto rounded" />
+                        {isVerifying && (
+                          <div className="flex items-center justify-center gap-2 text-primary">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            <span className="text-sm">Verifying token...</span>
+                          </div>
+                        )}
+                        {!isVerifying && isVerified && (
+                          <div className="flex items-center justify-center gap-2 text-green-600">
+                            <CheckCircle2 className="h-5 w-5" />
+                            <span className="text-sm font-medium">Token verified!</span>
+                          </div>
+                        )}
+                        {!isVerifying && !isVerified && mediaFile && (
+                          <div className="flex items-center justify-center gap-2 text-destructive">
+                            <XCircle className="h-5 w-5" />
+                            <span className="text-sm font-medium">Token not detected - please upload a clearer image</span>
+                          </div>
+                        )}
+                        {!isVerifying && mediaFile && (
+                          <div className="p-3 bg-secondary/50 rounded-lg border border-border">
+                            <p className="text-xs font-medium text-muted-foreground mb-1">Model Detected:</p>
+                            <p className="text-sm font-mono text-foreground break-words">
+                              {detectedText || "No text detected"}
+                            </p>
+                            <p className="text-xs text-muted-foreground mt-1">Expected: {verificationToken}</p>
+
+                            {detectionDetails.length > 0 && (
+                              <div className="mt-2">
+                                <p className="text-xs font-medium text-muted-foreground">Tried models:</p>
+                                <ul className="mt-1 space-y-1">
+                                  {detectionDetails.map((d, idx) => (
+                                    <li key={idx} className="text-xs text-muted-foreground">
+                                      <span className="font-medium text-foreground">{d.model}:</span> {d.text || "<no text>"}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        <p className="text-sm text-muted-foreground">Click to change</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <Upload className="h-12 w-12 mx-auto text-muted-foreground" />
+                        <div>
+                          <p className="text-sm font-medium">Click to upload image with token</p>
+                          <p className="text-xs text-muted-foreground">Photo must include verification token (max 10MB)</p>
+                        </div>
+                      </div>
+                    )}
+                  </label>
+                </div>
+              </div>
+
+              <div className="flex gap-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => navigate("/jobs")}
+                  className="flex-1"
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  type="submit" 
+                  disabled={isSubmitting || !isVerified || isVerifying} 
+                  className="flex-1"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Submitting...
+                    </>
+                  ) : (
+                    "Submit Work"
+                  )}
+                </Button>
+              </div>
+            </form>
+          </Form>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default SubmitWork;
